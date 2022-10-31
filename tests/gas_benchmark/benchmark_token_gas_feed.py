@@ -23,7 +23,7 @@ TOP_DECIMAL18_TOKENS = [
   ("0x853d955acef822db058eb8505911ed77f175b99e", 10000),    # FRAX 
   ("0xC0c293ce456fF0ED870ADd98a0828Dd4d2903DBF", 10000),    # AURA  
   ("0x6810e776880C02933D47DB1b9fc05908e5386b96", 500),      # GNO 
-  ("0x616e8BfA43F920657B3497DBf40D6b1A02D4608d", 2000),     # auraBAL
+  ("0x616e8BfA43F920657B3497DBf40D6b1A02D4608d", 4000),     # auraBAL
   ("0x62b9c7356a2dc64a1969e19c23e4f579f9810aa7", 10000),    # cvxCRV
   ("0x41d5d79431a913c4ae7d69a668ecdfe5ff9dfb68", 1000),     # INV
   ("0x6243d8cea23066d098a15582d81a598b4e8391f4", 1000),     # FLX
@@ -44,7 +44,7 @@ def test_oracle_feed_coverage(oneE18, weth, usdc, token, count, pricerwrapper):
     
   ## if tryQuoteWithFeed() return non-zero, so does findOptimalSwap()
   quote = pricer.tryQuoteWithFeedNonView(sell_token, buy_token, sell_amount)
-  print('SELLING ' + str(sell_amount) + sell_token + ' FOR ' + buy_token)
-  assert quote.return_value[0] < 110000 ## gas consumption for price feed with possible quote from on-chain dex sources  
+  print('SELLING ' + str(sell_amount) + ' ' + sell_token + ' FOR ' + buy_token)
+  assert quote.return_value[0] < 160000 ## gas consumption for price feed with possible quote from on-chain dex sources  
   assert quote.return_value[1] > 0 ## finalQuote is non-zero
  

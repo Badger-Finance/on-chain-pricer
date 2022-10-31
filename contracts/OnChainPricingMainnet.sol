@@ -160,7 +160,10 @@ contract OnChainPricingMainnet {
     uint256 private constant MAX_BPS = 10_000;
     uint256 private constant SECONDS_PER_HOUR = 3600;
     uint256 private constant SECONDS_PER_DAY = 86400;
-    uint256 public feed_tolerance = 500; // 5% Initially
+
+    // NOTE: This is effectively max loss for oracle covered swaps
+    // WP-L2 from watchpug for V4, lossing system-wide slippage from oracle feed
+    uint256 public feed_tolerance = 1000; // 10% Initially
 
     /// UniV3, replaces an array
     /// @notice We keep above constructor, because this is a gas optimization
@@ -196,7 +199,8 @@ contract OnChainPricingMainnet {
     struct FeedQuote {
         uint256 finalQuote;        // end-to-end quote from tokenIn to tokenOut for given amountIn
         uint256 tokenInToETH;      // bridging query from tokenIn to WETH using on-chain dex source
-        SwapType tokenInToETHType; // indicate the on-chain dex source bridging from tokenIn to WETH		 
+        SwapType tokenInToETHType; // indicate the on-chain dex source bridging from tokenIn to WETH
+        uint256 tokenInToETHFee;   // bridging swap fee setting from tokenIn to WETH using on-chain dex source, as typically in Uniswap V3 pool
     }
 
     /// @dev holding query parameters for on-chain dex source quote 
@@ -207,6 +211,7 @@ contract OnChainPricingMainnet {
         address connector;               // connector token in between: tokenIn -> connector token -> tokenOut, mainly used for Uniswap V3 and Balancer with connector (like WETH)
         uint256 tokenInToETHViaUniV3;    // output ETH amount from tokenIn via Uniswap V3 pool, possibly pre-calculated, see findExecutableSwap()
         uint256 tokenInToETHViaBalancer; // output ETH amount from tokenIn via Balancer pool, possibly pre-calculated, see findExecutableSwap()
+        uint256 tokenInToETHViaUniV3Fee; // swap fee setting from tokenIn to ETH via Uniswap V3 pool, possibly pre-calculated, see findExecutableSwap()
     }
 
     /// @dev Given tokenIn, out and amountIn, returns true if a quote will be non-zero
@@ -252,6 +257,18 @@ contract OnChainPricingMainnet {
         return false;
     }
 
+    /// WP-S4 from watchpug for V4: additional information to optimize routing and gas consumption
+    /// @dev External function to provide swap quote over selected on-chain dex sources
+    /// @param tokenIn - The token you want to sell
+    /// @param tokenOut - The token you want to buy
+    /// @param amountIn - The amount of token you want to sell
+    /// @param sources - The list of on-chain dex sources to be queried
+    function unsafeFindExecutableSwapWithSpecifiedSources(address tokenIn, address tokenOut, uint256 amountIn, SwapType[] calldata sources) external view returns (Quote memory q) {
+        require(sources.length > 0, '!sources');
+        FindSwapQuery memory _query = FindSwapQuery(tokenIn, tokenOut, amountIn, WETH, 0, 0, 0);
+        q = _findOptimalSwapWithSources(_query, sources);
+    }
+
     /// @dev External function to provide swap quote which prioritize price feed over on-chain dex source, 
     /// @dev this is virtual so you can override, see Lenient Version
     /// @notice This function is meant to never revert, it will return 0 when it captures a revert
@@ -260,15 +277,19 @@ contract OnChainPricingMainnet {
     /// @param tokenOut - The token you want to buy
     /// @param amountIn - The amount of token you want to sell
     function findOptimalSwap(address tokenIn, address tokenOut, uint256 amountIn) public view virtual returns (Quote memory q) {
-        uint256 _qFeed = tryQuoteWithFeed(tokenIn, tokenOut, amountIn);
-        if (_qFeed > 0) {
-            bytes32[] memory dummyPools;
-            uint256[] memory dummyPoolFees;
-            q = Quote(SwapType.PRICEFEED, _qFeed, dummyPools, dummyPoolFees);		
-        } else {
-            FindSwapQuery memory _query = FindSwapQuery(tokenIn, tokenOut, amountIn, WETH, 0, 0);	
+        q = _getQuoteFromDirectOracleFeed(tokenIn, tokenOut, amountIn);
+        if (q.amountOut <= 0) {
+            FindSwapQuery memory _query = FindSwapQuery(tokenIn, tokenOut, amountIn, WETH, 0, 0, 0);	
             q = _findOptimalSwap(_query);
         } 
+    }
+	
+    /// @dev Quote from oracle feed directly
+    function _getQuoteFromDirectOracleFeed(address tokenIn, address tokenOut, uint256 amountIn) internal view returns (Quote memory q) {
+        uint256 _qFeed = tryQuoteWithFeed(tokenIn, tokenOut, amountIn);
+        bytes32[] memory dummyPools;
+        uint256[] memory dummyPoolFees;
+        q = Quote(SwapType.PRICEFEED, _qFeed, dummyPools, dummyPoolFees);
     }
 
     /// @dev View function to provide EXECUTABLE quote from tokenIn to tokenOut with given amountIn
@@ -280,7 +301,8 @@ contract OnChainPricingMainnet {
         FeedQuote memory _qFeed = _feedWithPossibleETHConnector(tokenIn, tokenOut, amountIn);
         require(_qFeed.finalQuote > 0, "no feed");
 		
-        FindSwapQuery memory _query = FindSwapQuery(tokenIn, tokenOut, amountIn, WETH, (_qFeed.tokenInToETHType == SwapType.UNIV3? _qFeed.tokenInToETH : 0), (_qFeed.tokenInToETHType == SwapType.BALANCER? _qFeed.tokenInToETH : 0));	
+        uint256 _v3Fee = _qFeed.tokenInToETHType == SwapType.UNIV3? _qFeed.tokenInToETHFee : 0;
+        FindSwapQuery memory _query = FindSwapQuery(tokenIn, tokenOut, amountIn, WETH, (_qFeed.tokenInToETHType == SwapType.UNIV3? _qFeed.tokenInToETH : 0), (_qFeed.tokenInToETHType == SwapType.BALANCER? _qFeed.tokenInToETH : 0), _v3Fee);	
         q = _findOptimalSwap(_query);		
         require(q.amountOut >= (_qFeed.finalQuote * (MAX_BPS - feed_tolerance) / MAX_BPS), '!feedSlip');
     }	
@@ -289,15 +311,21 @@ contract OnChainPricingMainnet {
     /// @dev this is virtual so you can override, see Lenient Version
     /// @dev This function will use directly the quote from on-chain dex source no matter how poorly bad (e.g., illiquid pair) it might be
     function unsafeFindExecutableSwap(address tokenIn, address tokenOut, uint256 amountIn) public view virtual returns (Quote memory q) {	
-        FindSwapQuery memory _query = FindSwapQuery(tokenIn, tokenOut, amountIn, WETH, 0, 0);	
+        FindSwapQuery memory _query = FindSwapQuery(tokenIn, tokenOut, amountIn, WETH, 0, 0, 0);	
         q = _findOptimalSwap(_query);
     }
 
     /// === COMPONENT FUNCTIONS === ///
+	
+    /// @dev use all available DEX as default
+    function _findOptimalSwap(FindSwapQuery memory _query) internal view returns (Quote memory) {
+        SwapType[] memory _allDefaultSrcs;
+        return _findOptimalSwapWithSources(_query, _allDefaultSrcs);
+    }
 
     /// @dev View function for testing the routing of the strategy
     /// See {findOptimalSwap}
-    function _findOptimalSwap(FindSwapQuery memory _query) internal view returns (Quote memory) {
+    function _findOptimalSwapWithSources(FindSwapQuery memory _query, SwapType[] memory sources) internal view returns (Quote memory) {
         address tokenIn = _query.tokenIn;
         address tokenOut = _query.tokenOut;
         uint256 amountIn = _query.amountIn;
@@ -309,7 +337,7 @@ contract OnChainPricingMainnet {
         bytes32[] memory dummyPools;
         uint256[] memory dummyPoolFees;
 
-        (address curvePool, uint256 curveQuote) = getCurvePrice(CURVE_ROUTER, tokenIn, tokenOut, amountIn);
+        (address curvePool, uint256 curveQuote) = _ifSourceSpecified(sources, SwapType.CURVE)? getCurvePrice(CURVE_ROUTER, tokenIn, tokenOut, amountIn) : (address(0), 0);
         if (curveQuote > 0){		   
             (bytes32[] memory curvePools, uint256[] memory curvePoolFees) = _getCurveFees(curvePool);
             quotes[0] = Quote(SwapType.CURVE, curveQuote, curvePools, curvePoolFees);		
@@ -317,18 +345,44 @@ contract OnChainPricingMainnet {
             quotes[0] = Quote(SwapType.CURVE, curveQuote, dummyPools, dummyPoolFees);         			
         }
 
-        quotes[1] = Quote(SwapType.UNIV2, getUniPrice(UNIV2_ROUTER, tokenIn, tokenOut, amountIn), dummyPools, dummyPoolFees);
+        quotes[1] = _ifSourceSpecified(sources, SwapType.UNIV2)? Quote(SwapType.UNIV2, getUniPrice(UNIV2_ROUTER, tokenIn, tokenOut, amountIn), dummyPools, dummyPoolFees) : Quote(SwapType.UNIV2, 0, dummyPools, dummyPoolFees);
 
-        quotes[2] = Quote(SwapType.SUSHI, getUniPrice(SUSHI_ROUTER, tokenIn, tokenOut, amountIn), dummyPools, dummyPoolFees);
-
-        quotes[3] = Quote(SwapType.UNIV3, getUniV3Price(tokenIn, amountIn, tokenOut), dummyPools, dummyPoolFees);
-
-        quotes[4] = Quote(SwapType.BALANCER, getBalancerPriceAnalytically(tokenIn, amountIn, tokenOut), dummyPools, dummyPoolFees);
+        quotes[2] = _ifSourceSpecified(sources, SwapType.SUSHI)? Quote(SwapType.SUSHI, getUniPrice(SUSHI_ROUTER, tokenIn, tokenOut, amountIn), dummyPools, dummyPoolFees) : Quote(SwapType.SUSHI, 0, dummyPools, dummyPoolFees);
+        
+        {
+            (uint256 uniV3Quote, uint24 uniV3PoolFees) = _ifSourceSpecified(sources, SwapType.UNIV3)? getUniV3Price(tokenIn, amountIn, tokenOut) : (0, 0);
+            if (uniV3Quote > 0){
+                uint256[] memory _v3Fees = new uint256[](1);
+                _v3Fees[0] = uint256(uniV3PoolFees);
+                quotes[3] = Quote(SwapType.UNIV3, uniV3Quote, dummyPools, _v3Fees);			
+            } else{
+                quotes[3] = Quote(SwapType.UNIV3, uniV3Quote, dummyPools, dummyPoolFees);				
+            }
+        }
+		
+        {
+            (uint256 balancerPrice, bytes32 balancerPoolId) = _ifSourceSpecified(sources, SwapType.BALANCER)? getBalancerPriceAnalytically(tokenIn, amountIn, tokenOut) : (0, BALANCERV2_NONEXIST_POOLID);
+            if (balancerPrice > 0){
+                bytes32[] memory _balPools = new bytes32[](1);
+                _balPools[0] = balancerPoolId;
+                quotes[4] = Quote(SwapType.BALANCER, balancerPrice, _balPools, dummyPoolFees);			
+            } else {
+                quotes[4] = Quote(SwapType.BALANCER, balancerPrice, dummyPools, dummyPoolFees);				
+            }
+        }
 
         if(!wethInvolved){
-            quotes[5] = Quote(SwapType.UNIV3WITHWETH, (_useSinglePoolInUniV3(tokenIn, tokenOut) > 0 ? 0 : getUniV3PriceWithConnector(_query)), dummyPools, dummyPoolFees);	
+		
+            {
+               quotes[5] = _ifSourceSpecified(sources, SwapType.UNIV3WITHWETH)? _getQuoteUniV3WithConnector(_query) : Quote(SwapType.UNIV3WITHWETH, 0, dummyPools, dummyPoolFees);	
 
-            quotes[6] = Quote(SwapType.BALANCERWITHWETH, getBalancerPriceWithConnectorAnalytically(_query), dummyPools, dummyPoolFees);		
+               (uint256 _qWithBalancerConnector, bytes32[] memory _poolIds) = _ifSourceSpecified(sources, SwapType.BALANCERWITHWETH)? getBalancerPriceWithConnectorAnalytically(_query) : (0, dummyPools);
+               if (_qWithBalancerConnector > 0){
+                   quotes[6] = Quote(SwapType.BALANCERWITHWETH, _qWithBalancerConnector, _poolIds, dummyPoolFees);			   
+               } else {
+                   quotes[6] = Quote(SwapType.BALANCERWITHWETH, _qWithBalancerConnector, dummyPools, dummyPoolFees);	
+               }			   
+            }	
         }
 
         // Because this is a generalized contract, it is best to just loop,
@@ -393,6 +447,25 @@ contract OnChainPricingMainnet {
     }
 	
     /// === UNIV3 === ///
+	
+    /// @dev locally assemble quote result from UniV3 with connector token to avoid stack too deep
+    function _getQuoteUniV3WithConnector(FindSwapQuery memory _query) internal view returns (Quote memory) {
+        uint24 _singleV3Fee = _useSinglePoolInUniV3(_query.tokenIn, _query.tokenOut);
+        bytes32[] memory dummyPools;
+        uint256[] memory _v3ConnectorFees;
+        uint256 _v3ConnectorQuote;
+        if (_singleV3Fee > 0){
+            _v3ConnectorFees = new uint256[](1);
+            _v3ConnectorFees[0] = _singleV3Fee;
+        } else {
+            (uint256 _qV3Conn, uint256[] memory _qV3ConnFees) = getUniV3PriceWithConnector(_query);
+            if (_qV3Conn > 0){
+                _v3ConnectorQuote = _qV3Conn;
+                _v3ConnectorFees = _qV3ConnFees;			
+            }
+        }
+        return Quote(SwapType.UNIV3WITHWETH, _v3ConnectorQuote, dummyPools, _v3ConnectorFees);
+	}
 	
     /// @dev explore Uniswap V3 pools to check if there is a chance to resolve the swap with in-range liquidity (i.e., without crossing ticks)
     /// @dev check helper UniV3SwapSimulator for more
@@ -546,25 +619,33 @@ contract OnChainPricingMainnet {
 	
     /// @dev Given the address of the input token & amount & the output token
     /// @return the quote for it
-    function getUniV3Price(address tokenIn, uint256 amountIn, address tokenOut) public view returns (uint256) {		
-        (uint256 _maxInRangeQuote, ) = sortUniV3Pools(tokenIn, amountIn, tokenOut);		
-        return _maxInRangeQuote;
+    function getUniV3Price(address tokenIn, uint256 amountIn, address tokenOut) public view returns (uint256, uint24) {		
+        (uint256 _maxInRangeQuote, uint24 _maxInRangeFees) = sortUniV3Pools(tokenIn, amountIn, tokenOut);		
+        return (_maxInRangeQuote, _maxInRangeFees);
     }
 	
     /// @dev Given the address of the input token & amount & the output token & connector token in between (input token ---> connector token ---> output token)
     /// @return the quote for it
-    function getUniV3PriceWithConnector(FindSwapQuery memory _query) public view returns (uint256) {
+    function getUniV3PriceWithConnector(FindSwapQuery memory _query) public view returns (uint256, uint256[] memory) {
+        uint256[] memory _fees;
         // Skip if there is a mainstrem direct swap or connector pools not exist
         bool _tokenInToConnectorPool = (_query.connector != WETH)? checkUniV3PoolsExistence(_query.tokenIn, _query.connector) : (_query.tokenInToETHViaUniV3 > 0? true : checkUniV3PoolsExistence(_query.tokenIn, _query.connector));
         if (!_tokenInToConnectorPool || !checkUniV3PoolsExistence(_query.connector, _query.tokenOut)){
-            return 0;
+            return (0, _fees);
         }
 		
-        uint256 connectorAmount = (_query.tokenInToETHViaUniV3 > 0 && _query.connector == WETH)? _query.tokenInToETHViaUniV3 : getUniV3Price(_query.tokenIn, _query.amountIn, _query.connector);	
+        bool _tokenInToConnectorSwapExist = _query.tokenInToETHViaUniV3 > 0 && _query.connector == WETH;
+        (uint256 connectorAmount, uint24 connectorSwapFee) = _tokenInToConnectorSwapExist? (_query.tokenInToETHViaUniV3, uint24(_query.tokenInToETHViaUniV3Fee)) : getUniV3Price(_query.tokenIn, _query.amountIn, _query.connector);	
         if (connectorAmount > 0){	
-            return getUniV3Price(_query.connector, connectorAmount, _query.tokenOut);
+            _fees = new uint256[](2);
+            _fees[0] = uint256(connectorSwapFee);
+			
+            (uint256 connectorToOutAmt, uint24 connectorToOutFee) = getUniV3Price(_query.connector, connectorAmount, _query.tokenOut);
+            _fees[1] = uint256(connectorToOutFee);
+            
+            return (connectorToOutAmt, _fees);
         } else{
-            return 0;
+            return (0, _fees);
         }
     }
 	
@@ -605,15 +686,15 @@ contract OnChainPricingMainnet {
     /// === BALANCER === ///
 	
     /// @dev Given the input/output token, returns the quote for input amount from Balancer V2 using its underlying math
-    function getBalancerPriceAnalytically(address tokenIn, uint256 amountIn, address tokenOut) public view returns (uint256) { 
+    function getBalancerPriceAnalytically(address tokenIn, uint256 amountIn, address tokenOut) public view returns (uint256, bytes32) { 
         bytes32 poolId = getBalancerV2Pool(tokenIn, tokenOut);
         if (poolId == BALANCERV2_NONEXIST_POOLID){
-            return 0;
+            return (0, poolId);
         }
-        return getBalancerQuoteWithinPoolAnalytcially(poolId, tokenIn, amountIn, tokenOut);
+        return (getBalancerQuoteWithinPoolAnalytically(poolId, tokenIn, amountIn, tokenOut), poolId);
     }
 	
-    function getBalancerQuoteWithinPoolAnalytcially(bytes32 poolId, address tokenIn, uint256 amountIn, address tokenOut) public view returns (uint256) {			
+    function getBalancerQuoteWithinPoolAnalytically(bytes32 poolId, address tokenIn, uint256 amountIn, address tokenOut) public view returns (uint256) {			
         uint256 _quote;		
         address _pool = getAddressFromBytes32Msb(poolId);
         
@@ -668,18 +749,27 @@ contract OnChainPricingMainnet {
     }
 	
     /// @dev Given the input/output/connector token, returns the quote for input amount from Balancer V2 using its underlying math
-    function getBalancerPriceWithConnectorAnalytically(FindSwapQuery memory _query) public view returns (uint256) {
-        bool _tokenInToConnectorNoPool = (_query.connector != WETH)? (getBalancerV2Pool(_query.tokenIn, _query.connector) == BALANCERV2_NONEXIST_POOLID) : 
-                                                                     (_query.tokenInToETHViaBalancer > 0? false : (getBalancerV2Pool(_query.tokenIn, _query.connector) == BALANCERV2_NONEXIST_POOLID));	
-        if (_tokenInToConnectorNoPool || getBalancerV2Pool(_query.connector, _query.tokenOut) == BALANCERV2_NONEXIST_POOLID){
-            return 0;
+    function getBalancerPriceWithConnectorAnalytically(FindSwapQuery memory _query) public view returns (uint256, bytes32[] memory) {
+        bytes32[] memory _poolIds;
+        bytes32 _poolId1 = getBalancerV2Pool(_query.tokenIn, _query.connector);
+        bool _tokenInToConnectorNoPool = (_query.connector != WETH)? (_poolId1 == BALANCERV2_NONEXIST_POOLID) : (_query.tokenInToETHViaBalancer > 0? false : _poolId1 == BALANCERV2_NONEXIST_POOLID);	
+		
+        bytes32 _poolId2 = getBalancerV2Pool(_query.connector, _query.tokenOut);
+        if (_tokenInToConnectorNoPool || _poolId2 == BALANCERV2_NONEXIST_POOLID){
+            return (0, _poolIds);
         }
 		
-        uint256 _in2ConnectorAmt = (_query.tokenInToETHViaBalancer > 0 && _query.connector == WETH)? _query.tokenInToETHViaBalancer : getBalancerPriceAnalytically(_query.tokenIn, _query.amountIn, _query.connector);
+        (uint256 _in2ConnectorAmt, ) = (_query.tokenInToETHViaBalancer > 0 && _query.connector == WETH)? (_query.tokenInToETHViaBalancer, _poolId1) : getBalancerPriceAnalytically(_query.tokenIn, _query.amountIn, _query.connector);
         if (_in2ConnectorAmt <= 0){
-            return 0;
+            return (0, _poolIds);
         }
-        return getBalancerPriceAnalytically(_query.connector, _in2ConnectorAmt, _query.tokenOut);    
+		
+        _poolIds = new bytes32[](2);
+        _poolIds[0] = _poolId1;
+        _poolIds[1] = _poolId2;
+		
+        (uint256 _connectorToOutAmt, ) = getBalancerPriceAnalytically(_query.connector, _in2ConnectorAmt, _query.tokenOut);
+        return (_connectorToOutAmt, _poolIds);    
     }
 	
     /// @return selected BalancerV2 pool given the tokenIn and tokenOut 
@@ -772,12 +862,12 @@ contract OnChainPricingMainnet {
         if (tokenIn == WETH){
             uint256 pOutETH = getPriceInETH(tokenOut);
             if (pOutETH > 0){
-                return FeedQuote((amountIn * 1e18 / pOutETH) * _getDecimalsMultiplier(tokenOut) / 1e18, 0, SwapType.PRICEFEED);			
+                return FeedQuote((amountIn * _getDecimalsMultiplier(tokenOut) / pOutETH), 0, SwapType.PRICEFEED, 0);			
             }
         } else if (tokenOut == WETH) {
             uint256 pInETH = getPriceInETH(tokenIn);
             if (pInETH > 0){
-                return FeedQuote((amountIn * pInETH / 1e18) * 1e18 / _getDecimalsMultiplier(tokenIn), 0, SwapType.PRICEFEED);			
+                return FeedQuote((amountIn * pInETH / _getDecimalsMultiplier(tokenIn)), 0, SwapType.PRICEFEED, 0);			
             }	
         }
         
@@ -787,32 +877,34 @@ contract OnChainPricingMainnet {
 		
         if (pInUSD == 0 && pOutUSD == 0) {
             // CASE WHEN both tokenIn and tokenOut got NO feed
-            return FeedQuote(0, 0, SwapType.PRICEFEED);		
+            return FeedQuote(0, 0, SwapType.PRICEFEED, 0);		
         } else if (pInUSD == 0){
             // CASE WHEN only tokenOut got feed and we have to resort on-chain dex source from tokenIn to ETH
-            FindSwapQuery memory _query = FindSwapQuery(tokenIn, WETH, amountIn, WETH, 0, 0);	
+            FindSwapQuery memory _query = FindSwapQuery(tokenIn, WETH, amountIn, WETH, 0, 0, 0);	
             Quote memory _tokenInToETHQuote = _findOptimalSwap(_query);
             if (_tokenInToETHQuote.amountOut > 0) {
                 uint256 _ethUSD = _ethUSDOut > 0? _ethUSDOut : getEthUsdPrice();
-                return FeedQuote((_tokenInToETHQuote.amountOut * _ethUSD / 1e18) * _getDecimalsMultiplier(tokenOut) / pOutUSD, _tokenInToETHQuote.amountOut, _tokenInToETHQuote.name);
+                uint256 _tokenInToETHFee = _tokenInToETHQuote.poolFees.length > 0? _tokenInToETHQuote.poolFees[0] : 0;
+                return FeedQuote((_tokenInToETHQuote.amountOut * _ethUSD * _getDecimalsMultiplier(tokenOut) / pOutUSD / 1e18), _tokenInToETHQuote.amountOut, _tokenInToETHQuote.name, _tokenInToETHFee);
             } else {
-                return FeedQuote(0, 0, SwapType.PRICEFEED);					
+                return FeedQuote(0, 0, SwapType.PRICEFEED, 0);					
             }
         } else if (pOutUSD == 0){
             // CASE WHEN only tokenIn got feed and we have to resort on-chain dex source from ETH to tokenOut
             uint256 _ethUSD = _ethUSDOut > 0? _ethUSDOut : getEthUsdPrice();
-            uint256 _inBtwETH = (pInUSD * amountIn / _getDecimalsMultiplier(tokenIn)) * 1e18 / _ethUSD; 
-            FindSwapQuery memory _query = FindSwapQuery(WETH, tokenOut, _inBtwETH, WETH, 0, 0);	
+            // WP-M3 from watchpug for V4: Division before multiplication might result precision loss, but be aware of the multiplication overflow if amountIn too big > 1e50
+            uint256 _inBtwETH = (pInUSD * amountIn * 1e18) / _getDecimalsMultiplier(tokenIn) / _ethUSD; 
+            FindSwapQuery memory _query = FindSwapQuery(WETH, tokenOut, _inBtwETH, WETH, 0, 0, 0);	
             Quote memory _ethToTokenOutQuote = _findOptimalSwap(_query);
             if (_ethToTokenOutQuote.amountOut > 0) {
-                return FeedQuote(_ethToTokenOutQuote.amountOut, 0, SwapType.PRICEFEED);
+                return FeedQuote(_ethToTokenOutQuote.amountOut, 0, SwapType.PRICEFEED, 0);
             } else {
-                return FeedQuote(0, 0, SwapType.PRICEFEED);					
+                return FeedQuote(0, 0, SwapType.PRICEFEED, 0);					
             }
         }
 		
         // CASE WHEN both tokenIn and tokenOut got feeds
-        return FeedQuote((amountIn * pInUSD / pOutUSD) * _getDecimalsMultiplier(tokenOut) / _getDecimalsMultiplier(tokenIn), 0, SwapType.PRICEFEED);		
+        return FeedQuote((amountIn * pInUSD * _getDecimalsMultiplier(tokenOut) / pOutUSD / _getDecimalsMultiplier(tokenIn)), 0, SwapType.PRICEFEED, 0);		
     }
 	
     /// @dev try to find USD price for given token from feed
@@ -828,7 +920,8 @@ contract OnChainPricingMainnet {
         uint256 _ethUSD = _prefetchedETHUSD;
 		
         if (_ifStablecoinForFeed(base)) {
-            return (1e8, _ethUSD);  // shortcut for stablecoin https://defillama.com/stablecoins/Ethereum
+            // WP-L1 from watchpug for V4: do we need to consider the risk of USDC/USDT's depeg?
+            return (1e8, _ethUSD);  // hardcoded as 1 USD as shortcut for gas saving https://defillama.com/stablecoins/Ethereum
         } else if (base == WBTC) {
             return (_fetchUSDPriceViaBTCFeed(base), _ethUSD);
         } else if (base == WETH){
@@ -965,5 +1058,15 @@ contract OnChainPricingMainnet {
     /// @return the result of "0x777788889999AaAAbBbbCcccddDdeeeEfFFfCcCc"
     function getAddressFromBytes32Lsb(bytes32 _input) public pure returns (address){
         return address(uint160(uint256(_input)));
+    }
+
+    /// @dev Returns whether it is selected by given _sources for the target SwapType _src.
+    function _ifSourceSpecified(SwapType[] memory _sources, SwapType _src) internal view returns (bool) {
+        if (_sources.length <= 0) return true;
+		
+        for (uint i = 0;i < _sources.length;i++){
+             if (_sources[i] == _src) return true;
+        }
+        return false;
     }
 }
